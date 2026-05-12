@@ -1,4 +1,4 @@
-# QGZ Repath Tool v2.3
+# QGZ Repath Tool v2.4
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![PySide6](https://img.shields.io/badge/UI-PySide6%20%28Qt6%29-41a42a)
@@ -22,10 +22,11 @@ QGZ Repath Tool lee el archivo comprimido, detecta qué rutas están rotas, las 
 - **Detección automática de rutas rotas** — distingue rutas absolutas accesibles en el equipo actual de las que están rotas, y solo muestra estas últimas para corrección.
 - **Soporte de rutas `localized:`** — gestiona correctamente el espacio de nombres relativo que generan algunos plugins de QGIS, resolviendo grupos enteros a partir de su carpeta raíz.
 - **Auto-resolución por carpeta raíz común** — si la mayoría de las rutas comparten una carpeta madre, indicarla en el Paso 2 resuelve automáticamente todo lo que se pueda sin intervención manual.
+- **Agrupación inteligente por rama divergente** — cuando las rutas absolutas tienen distintas subcarpetas bajo un prefijo común, la herramienta las separa en grupos independientes y calcula el prefijo más profundo posible para cada uno, evitando asignaciones ambiguas.
 - **Resolución manual de grupos pendientes** — las rutas que no se han podido resolver automáticamente se presentan agrupadas en el Paso 3 con un selector de carpeta.
 - **Vista previa no destructiva** — simula los cambios en el log antes de escribir nada a disco.
 - **Salida segura** — genera siempre un archivo `<nombre>_repath.qgz` nuevo; el proyecto original no se modifica.
-- **Compatibilidad multiplataforma** — normaliza separadores (`/` ↔ `\`) según el sistema operativo de destino.
+- **Compatibilidad multiplataforma** — normaliza separadores (`/` ↔ `\`) según el sistema operativo de destino. La interfaz usa el estilo Fusion de Qt con paleta oscura explícita para garantizar colores correctos en Windows, Linux y macOS.
 - **Compatibilidad `.qgs`** — funciona también con proyectos en formato XML plano (sin comprimir).
 
 ---
@@ -79,7 +80,7 @@ Si la mayoría de las rutas comparten una carpeta raíz (por ejemplo, `SIG_DATOS
 
 ### Paso 3 — Rutas pendientes de resolución manual
 
-Los grupos que no pudieron resolverse automáticamente aparecen listados con una muestra de sus rutas. Para cada grupo, usa **Examinar...** para seleccionar la carpeta de destino en el equipo actual.
+Los grupos que no pudieron resolverse automáticamente aparecen listados, uno por rama divergente, con una muestra de sus rutas y el prefijo más profundo posible. Para cada grupo, usa **Examinar...** para seleccionar la carpeta de destino en el equipo actual.
 
 ### Vista previa y aplicar
 
@@ -99,9 +100,11 @@ La función `_classify()` analiza cada valor encontrado en los nodos `<datasourc
 - Rutas absolutas de Windows (`C:\...`) o Unix (`/ruta/...`) → **grupo absoluto**
 - Resto → **ignoradas**
 
-### Agrupación por prefijo común
+### Agrupación por rama divergente
 
-Las rutas absolutas se agrupan por letra de unidad (Windows) o por raíz Unix. Dentro de cada grupo, `_common_left_segs()` aplica `zip(*segmentos)` para encontrar el prefijo compartido más largo nivel a nivel, que es lo que se presenta al usuario para reasignar.
+Las rutas absolutas se agrupan por letra de unidad en Windows. Para rutas Unix, `_group_unix_paths()` calcula el prefijo común global y, si en el nivel inmediatamente siguiente existen segmentos distintos (ramas divergentes), divide las rutas en subgrupos independientes. Cada subgrupo recibe su propio prefijo más profundo posible.
+
+Por ejemplo, si un proyecto contiene rutas bajo `/media/Datos/RiMo/...`, `/media/Datos/SIG_GIS/...` y `/media/Datos/CXSync/...`, la herramienta presentará tres filas en el Paso 3 en lugar de una sola fila con el prefijo genérico `/media/Datos`. Esto evita que una asignación demasiado corta produzca rutas con subcarpetas duplicadas en el archivo de salida.
 
 ### Rutas `localized:`
 
@@ -115,6 +118,10 @@ Al analizar y al aplicar la raíz común, la herramienta comprueba si cada ruta 
 
 La función `process_qgz()` abre el `.qgz` original en modo lectura y escribe el resultado en un archivo nuevo, copiando sin modificar todos los archivos que no sean `.qgs` (incluida la base de datos auxiliar `.qgd`).
 
+### Compatibilidad de colores multiplataforma
+
+La interfaz aplica el estilo Fusion de Qt junto con una paleta oscura explícita al arrancar, lo que garantiza que los colores del log y los controles se rendericen correctamente en Windows, Linux y macOS sin depender del tema nativo del sistema operativo. El log usa inserción de HTML (`insertHtml`) en lugar de `setTextColor` para asegurar el color en todos los entornos.
+
 ---
 
 ## Troubleshooting
@@ -125,7 +132,19 @@ La función `process_qgz()` abre el `.qgz` original en modo lectura y escribe el
 | Una carpeta no se resuelve con la raíz común | El nombre del primer segmento de la ruta `localized:` difiere de la carpeta real | Indicarla manualmente en el Paso 3 |
 | El archivo `_repath.qgz` no carga en QGIS | Una ruta fue asignada incorrectamente | Usar **Vista previa** antes de aplicar para verificar las sustituciones en el log |
 | Las rutas absolutas aparecen en el Paso 3 aunque existen | La comprobación usa el primer archivo del grupo como muestra | Verificar que la ruta del primer archivo del grupo sea accesible |
+| La ruta resultante contiene subcarpetas duplicadas | Se usó una versión anterior (≤ v2.3) que agrupaba todas las rutas unix bajo el prefijo mínimo común | Actualizar a v2.4 o superior; la nueva agrupación por rama divergente evita este problema |
 | Error `ModuleNotFoundError: PySide6` | PySide6 no instalado en el entorno activo | `pip install PySide6` en el entorno correcto |
+
+---
+
+## Cambios por versión
+
+### v2.4
+- **Fix rutas:** `_group_unix_paths()` reemplaza la agrupación global de rutas unix por una agrupación por rama divergente, mostrando un prefijo más profundo y específico por cada subgrupo. Esto elimina el problema de subcarpetas duplicadas en la ruta de salida cuando distintas ramas del árbol de directorios comparten un prefijo corto.
+- **Fix colores Windows:** estilo Fusion + paleta oscura explícita aplicados en el arranque; log reescrito con `insertHtml` para colores fiables en todos los sistemas operativos.
+
+### v2.3
+- Versión inicial pública.
 
 ---
 
@@ -144,3 +163,4 @@ Para proponer mejoras, abre un Pull Request con descripción del cambio y, si ap
 ## Licencia
 
 MIT — consulta el archivo `LICENSE` en la raíz del repositorio.
+
