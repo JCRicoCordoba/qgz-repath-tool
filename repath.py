@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-QGZ Repath Tool v2.3
+QGZ Repath Tool v2.4
 Repatea rutas en proyectos QGIS (.qgz/.qgs) al cambiar de equipo.
 Interfaz moderna con PySide6 (Qt6).
 """
 from __future__ import annotations
+import html as _html
 import re, sys, zipfile
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -12,14 +13,14 @@ from typing import Callable, Dict, List, Optional, Tuple
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QFileDialog, QMessageBox,
-    QProgressBar, QTextEdit, QGroupBox, QFormLayout, QScrollArea,
-    QFrame, QSizePolicy
+    QProgressBar, QTextEdit, QGroupBox, QScrollArea,
+    QFrame,
 )
 from PySide6.QtGui import QFont, QTextCursor, QPalette, QColor
 from PySide6.QtCore import Qt
 
 APP_TITLE   = "QGZ Repath Tool"
-APP_VERSION = "2.3"
+APP_VERSION = "2.4"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ── CORE ─────────────────────────────────────────────────────────────────────
@@ -108,6 +109,52 @@ def _make_prefix(segs: List[str], is_win: bool) -> str:
         return segs[0] + '\\' + ('\\'.join(segs[1:]) if len(segs) > 1 else '')
     return '/' + '/'.join(segs)
 
+def _group_unix_paths(paths: List[str], result: Dict[str, List[str]]) -> None:
+    """
+    Agrupa las rutas unix en subgrupos significativos.
+
+    Algoritmo: calcula el prefijo comun global y, si hay divergencia en el
+    siguiente nivel, divide recursivamente por ese segmento divergente.
+    Cada subgrupo muestra el prefijo comun MAS PROFUNDO posible, evitando
+    que el usuario tenga que asignar un prefijo demasiado corto que luego
+    produzca rutas duplicadas.
+    """
+    if not paths:
+        return
+    if len(paths) == 1:
+        s = _segs(paths[0])
+        pfx = _make_prefix(s[:-1] if len(s) > 1 else s, False)
+        result.setdefault(pfx, []).extend(paths)
+        return
+
+    common = _common_left_segs(paths)
+    depth  = len(common)
+
+    # Agrupa por el segmento inmediatamente posterior al prefijo comun
+    branches: Dict[str, List[str]] = {}
+    for p in paths:
+        segs = _segs(p)
+        key  = segs[depth] if len(segs) > depth else '__leaf__'
+        branches.setdefault(key, []).append(p)
+
+    if len(branches) == 1:
+        # Todas las rutas comparten el mismo siguiente segmento:
+        # usar el prefijo comun tal cual (ya es el mas profundo posible).
+        pfx = _make_prefix(common if common else _segs(paths[0])[:4], False)
+        result.setdefault(pfx, []).extend(paths)
+    else:
+        # Hay divergencia: procesar cada rama por separado para obtener
+        # su propio prefijo comun mas profundo.
+        for branch_paths in branches.values():
+            if len(branch_paths) == 1:
+                s = _segs(branch_paths[0])
+                pfx = _make_prefix(s[:-1] if len(s) > 1 else s, False)
+                result.setdefault(pfx, []).extend(branch_paths)
+            else:
+                cs  = _common_left_segs(branch_paths)
+                pfx = _make_prefix(cs if cs else _segs(branch_paths[0])[:4], False)
+                result.setdefault(pfx, []).extend(branch_paths)
+
 def group_absolute(paths: List[str]) -> Dict[str, List[str]]:
     win:  Dict[str, List[str]] = {}
     unix: List[str] = []
@@ -118,16 +165,18 @@ def group_absolute(paths: List[str]) -> Dict[str, List[str]]:
         else:
             unix.append(p)
     result: Dict[str, List[str]] = {}
+
+    # Rutas Windows: agrupar por letra de unidad
     for _, grp in win.items():
         s   = _segs(grp[0])
         cs  = _common_left_segs(grp) if len(grp) > 1 else s[:-1] if len(s) > 1 else s
         pfx = _make_prefix(cs if len(cs) > 1 else s[:4], True)
         result.setdefault(pfx, []).extend(grp)
+
+    # Rutas Unix: subagrupacion por rama divergente
     if unix:
-        s   = _segs(unix[0])
-        cs  = _common_left_segs(unix) if len(unix) > 1 else s[:-1] if len(s) > 1 else s
-        pfx = _make_prefix(cs if len(cs) > 1 else s[:4], False)
-        result.setdefault(pfx, []).extend(unix)
+        _group_unix_paths(unix, result)
+
     return result
 
 def group_localized(rels: List[str]) -> Dict[str, List[str]]:
@@ -271,14 +320,52 @@ def process_qgz(
 # ── UI (PySide6) ───────────────────────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# No usamos hilos personalizados para evitar segfaults
-# Usamos threading.Thread con QTimer.singleShot para actualizaciones seguras de la GUI
+# Paleta oscura para uso global
+_C_BG        = "#2e2e2e"
+_C_BG_DARK   = "#1a1a2e"
+_C_TEXT      = "#e2e2e2"
+_C_GREEN     = "#41a42a"
+_C_ROW_LOC   = "#1a2a3a"
+_C_ROW_ABS   = "#2a2a3a"
+
+_LOG_COLORS = {
+    'info':   "#e2e2e2",
+    'ok':     "#50fa7b",
+    'warn':   "#f1fa8c",
+    'error':  "#ff6e6e",
+    'head':   "#8be9fd",
+    'orange': "#ffb86c",
+}
+
+def _dark_palette() -> QPalette:
+    p = QPalette()
+    bg   = QColor(_C_BG)
+    bgd  = QColor(_C_BG_DARK)
+    txt  = QColor(_C_TEXT)
+    grn  = QColor(_C_GREEN)
+    mid  = QColor("#3a3a3a")
+    p.setColor(QPalette.ColorRole.Window,          bg)
+    p.setColor(QPalette.ColorRole.WindowText,      txt)
+    p.setColor(QPalette.ColorRole.Base,            bgd)
+    p.setColor(QPalette.ColorRole.AlternateBase,   mid)
+    p.setColor(QPalette.ColorRole.Text,            txt)
+    p.setColor(QPalette.ColorRole.BrightText,      txt)
+    p.setColor(QPalette.ColorRole.Button,          mid)
+    p.setColor(QPalette.ColorRole.ButtonText,      txt)
+    p.setColor(QPalette.ColorRole.Highlight,       grn)
+    p.setColor(QPalette.ColorRole.HighlightedText, QColor("#000000"))
+    p.setColor(QPalette.ColorRole.ToolTipBase,     QColor("#3a3a3a"))
+    p.setColor(QPalette.ColorRole.ToolTipText,     txt)
+    p.setColor(QPalette.ColorRole.Link,            grn)
+    p.setColor(QPalette.ColorRole.PlaceholderText, QColor("#888888"))
+    return p
+
 
 class RepathApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_TITLE}  v{APP_VERSION}")
-        self.setMinimumSize(1000, 600)
+        self.setMinimumSize(1000, 620)
 
         self._qgz:      Optional[Path]         = None
         self._abs_g:    Dict[str, List[str]]   = {}
@@ -292,6 +379,8 @@ class RepathApp(QMainWindow):
         self._setup_ui()
         self._center()
 
+    # ── setup ──────────────────────────────────────────────────────────────
+
     def _setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -300,7 +389,6 @@ class RepathApp(QMainWindow):
         outer_layout.setContentsMargins(4, 4, 4, 4)
 
         inner_widget = QWidget()
-        inner_widget.setStyleSheet("background-color: #2e2e2e;")
         outer_layout.addWidget(inner_widget)
 
         main_layout = QHBoxLayout(inner_widget)
@@ -311,25 +399,18 @@ class RepathApp(QMainWindow):
         toolbar = self.addToolBar("TopBar")
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
-        toolbar.setStyleSheet("background-color: #41a42a; spacing: 10px; padding: 6px;")
+        toolbar.setStyleSheet(
+            f"background-color: {_C_GREEN}; spacing: 10px; padding: 6px;"
+        )
         title_label = QLabel(f"  {APP_TITLE}  v{APP_VERSION}  ")
         title_label.setStyleSheet("color: white; font-size: 14px; font-weight: bold;")
         toolbar.addWidget(title_label)
-
-        self.setStyleSheet("""
-            QMainWindow {
-                border: 6px solid #41a42a;
-                background-color: #2e2e2e;
-            }
-        """)
-        if self.centralWidget():
-            self.centralWidget().setStyleSheet("background-color: #2e2e2e; margin: 6px;")
 
         # Left Panel
         left_panel = QVBoxLayout()
         left_panel.setSpacing(10)
 
-        # Paso 1: Selección de archivo
+        # ── Paso 1 ──────────────────────────────────────────────────────
         f1 = QGroupBox("Paso 1 — Selecciona el proyecto QGIS")
         f1_layout = QVBoxLayout(f1)
         row1 = QHBoxLayout()
@@ -346,11 +427,14 @@ class RepathApp(QMainWindow):
         f1_layout.addLayout(row1)
         left_panel.addWidget(f1)
 
-        # Step 2: Common Root
+        # ── Paso 2 ──────────────────────────────────────────────────────
         f2 = QGroupBox("Paso 2 — Carpeta raiz comun (opcional pero recomendado)")
         f2_layout = QVBoxLayout(f2)
-        info = QLabel("Si la mayoria de rutas comparten una carpeta raiz (ej. SIG_DATOS),\nindicala aqui. El tool resolvera automaticamente todo lo que pueda.")
-        info.setStyleSheet("color: #555;")
+        info = QLabel(
+            "Si la mayoria de rutas comparten una carpeta raiz (ej. SIG_DATOS),\n"
+            "indicala aqui. El tool resolvera automaticamente todo lo que pueda."
+        )
+        info.setStyleSheet("color: #aaa;")
         f2_layout.addWidget(info)
         row2 = QHBoxLayout()
         self.root_edit = QLineEdit()
@@ -365,11 +449,11 @@ class RepathApp(QMainWindow):
         row2.addWidget(self.btn_resolve)
         f2_layout.addLayout(row2)
         self.lbl_root_prev = QLabel("")
-        self.lbl_root_prev.setStyleSheet("color: green;")
+        self.lbl_root_prev.setStyleSheet("color: #50fa7b;")
         f2_layout.addWidget(self.lbl_root_prev)
         left_panel.addWidget(f2)
 
-        # Step 3: Pending Groups
+        # ── Paso 3 ──────────────────────────────────────────────────────
         f3 = QGroupBox("Paso 3 — Rutas que necesitan indicacion manual")
         f3_layout = QVBoxLayout(f3)
         f3_layout.setSpacing(0)
@@ -378,22 +462,24 @@ class RepathApp(QMainWindow):
         self.scroll_content = QWidget()
         self.scroll_layout = QVBoxLayout(self.scroll_content)
         self.scroll_layout.setAlignment(Qt.AlignTop)
-        self.scroll_layout.setSpacing(0)
-        self.scroll_layout.setContentsMargins(0, 0, 0, 0)
+        self.scroll_layout.setSpacing(4)
+        self.scroll_layout.setContentsMargins(4, 4, 4, 4)
         self.scroll_area.setWidget(self.scroll_content)
         f3_layout.addWidget(self.scroll_area)
 
         hint = QLabel("Analiza un fichero .qgz para comenzar.")
-        hint.setStyleSheet("color: #999;")
+        hint.setStyleSheet("color: #888;")
         self.scroll_layout.addWidget(hint)
         self._hint = hint
 
-        note = QLabel("Solo aparecen aqui las rutas que no pudieron resolverse con la carpeta raiz.")
-        note.setStyleSheet("color: #666;")
+        note = QLabel(
+            "Solo aparecen aqui las rutas que no pudieron resolverse con la carpeta raiz."
+        )
+        note.setStyleSheet("color: #888;")
         f3_layout.addWidget(note)
         left_panel.addWidget(f3, 1)
 
-        # Action Buttons
+        # ── Botones de accion ────────────────────────────────────────────
         btn_layout = QHBoxLayout()
         self.btn_preview = QPushButton("Vista previa")
         self.btn_preview.clicked.connect(self._preview)
@@ -410,12 +496,12 @@ class RepathApp(QMainWindow):
         left_panel.addLayout(btn_layout)
 
         note2 = QLabel("Salida: <nombre>_repath.qgz  (el original no se modifica)")
-        note2.setStyleSheet("color: #777;")
+        note2.setStyleSheet("color: #888;")
         left_panel.addWidget(note2)
 
         main_layout.addLayout(left_panel, 1)
 
-        # Right Panel (Log)
+        # ── Panel derecho (Log) ──────────────────────────────────────────
         right_panel = QVBoxLayout()
         fl = QGroupBox("Log")
         fl_layout = QVBoxLayout(fl)
@@ -424,16 +510,16 @@ class RepathApp(QMainWindow):
         fl_layout.addWidget(btn_clear, 0, Qt.AlignRight)
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
-        self.log_edit.setFont(QFont("Monospace", 10))
-        palette = self.log_edit.palette()
-        palette.setColor(QPalette.ColorRole.Base, QColor("#1a1a2e"))
-        palette.setColor(QPalette.ColorRole.Text, QColor("#e2e2e2"))
-        self.log_edit.setPalette(palette)
+        self.log_edit.setFont(QFont("Courier New", 9))
+        self.log_edit.setStyleSheet(
+            f"QTextEdit {{ background-color: {_C_BG_DARK}; "
+            f"color: {_C_TEXT}; border: 1px solid #444; }}"
+        )
         fl_layout.addWidget(self.log_edit)
         right_panel.addWidget(fl, 1)
         main_layout.addLayout(right_panel)
 
-        self._out('QGZ Repath Tool  v2.3', 'head')
+        self._out(f'QGZ Repath Tool  v{APP_VERSION}', 'head')
         self._out('Selecciona un .qgz y pulsa Analizar.', 'info')
 
     def _center(self):
@@ -442,23 +528,32 @@ class RepathApp(QMainWindow):
         qr.moveCenter(cp)
         self.move(qr.topLeft())
 
+    # ── Log ────────────────────────────────────────────────────────────
+
     def _out(self, msg: str, tag: str = 'info') -> None:
-        color = "#e2e2e2"
-        if tag == 'ok': color = "#50fa7b"
-        elif tag == 'warn': color = "#f1fa8c"
-        elif tag == 'error': color = "#ff6e6e"
-        elif tag == 'head': color = "#8be9fd"
-        elif tag == 'orange': color = "#ffb86c"
-        self.log_edit.setTextColor(QColor(color))
-        self.log_edit.append(msg)
-        self.log_edit.moveCursor(QTextCursor.End)
+        color = _LOG_COLORS.get(tag, _LOG_COLORS['info'])
+        safe  = _html.escape(str(msg)).replace('\n', '<br>')
+        cursor = self.log_edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertHtml(
+            f'<span style="color:{color};font-family:\'Courier New\',monospace;">'
+            f'{safe}</span><br>'
+        )
+        self.log_edit.setTextCursor(cursor)
+        self.log_edit.ensureCursorVisible()
 
     def _log_clear(self) -> None:
         self.log_edit.clear()
 
+    # ── Paso 1 ─────────────────────────────────────────────────────────
+
     def _browse_qgz(self) -> None:
-        p, _ = QFileDialog.getOpenFileName(self, "Selecciona proyecto QGIS", "", "Proyecto QGIS (*.qgz *.qgs);;Todos (*.*)")
-        if not p: return
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Selecciona proyecto QGIS", "",
+            "Proyecto QGIS (*.qgz *.qgs);;Todos (*.*)"
+        )
+        if not p:
+            return
         self._qgz = Path(p)
         self.file_edit.setText(p)
         self.btn_analyze.setEnabled(True)
@@ -473,7 +568,7 @@ class RepathApp(QMainWindow):
             return
         if self._busy:
             return
-            
+
         self._busy = True
         self._log_clear()
         self._out(f"Analizando {self._qgz.name} ...", 'info')
@@ -485,10 +580,6 @@ class RepathApp(QMainWindow):
         self.progress.setVisible(True)
 
         try:
-            def logger(msg, tag='info'):
-                self._out(msg, tag)
-            
-            logger(f"Analizando {self._qgz.name} ...", 'info')
             abs_g, loc_g = analyze_qgz(self._qgz)
             self._on_analyzed((abs_g, loc_g))
         except Exception as e:
@@ -518,22 +609,32 @@ class RepathApp(QMainWindow):
         if abs_g:
             ok  = [(p, v) for p, v in abs_g.items() if Path(v[0]).exists()]
             bad = [(p, v) for p, v in abs_g.items() if not Path(v[0]).exists()]
-            self._out(f"Prefijos absolutos: {len(ok)} accesible(s), {len(bad)} roto(s):", 'info')
+            self._out(
+                f"Prefijos absolutos: {len(ok)} accesible(s), {len(bad)} roto(s):", 'info'
+            )
             for pfx, paths in ok:
-                self._out(f"  ✓ {pfx}  ({len(paths)} ruta(s))", 'ok')
+                self._out(f"  \u2713 {pfx}  ({len(paths)} ruta(s))", 'ok')
             for pfx, paths in bad:
-                self._out(f"  ✗ {pfx}  ({len(paths)} ruta(s))", 'warn')
+                self._out(f"  \u2717 {pfx}  ({len(paths)} ruta(s))", 'warn')
         if not abs_g and not loc_g:
             self._out("No hay rutas que actualizar.", 'warn')
             return
         self.btn_resolve.setEnabled(True)
-        self._out("\nPaso 2: indica la carpeta raiz comun y pulsa 'Aplicar raiz'.", 'head')
-        self._out("Si no hay raiz comun, pulsa 'Aplicar raiz' con el campo vacio\npara ir directamente al paso 3.", 'info')
+        self._out(
+            "\nPaso 2: indica la carpeta raiz comun y pulsa 'Aplicar raiz'.", 'head'
+        )
+        self._out(
+            "Si no hay raiz comun, pulsa 'Aplicar raiz' con el campo vacio\n"
+            "para ir directamente al paso 3.", 'info'
+        )
+
+    # ── Paso 2 ─────────────────────────────────────────────────────────
 
     def _browse_root(self) -> None:
         ini = self.root_edit.text().strip() or str(Path.home())
         p = QFileDialog.getExistingDirectory(self, "Selecciona la carpeta raiz comun", ini)
-        if p: self.root_edit.setText(p)
+        if p:
+            self.root_edit.setText(p)
 
     def _root_preview(self):
         root = self.root_edit.text().strip()
@@ -541,11 +642,14 @@ class RepathApp(QMainWindow):
             self.lbl_root_prev.setText("")
             return
         is_win = bool(re.match(r'[A-Za-z]:', root))
-        sep = '\\' if is_win else '/'
-        segs = list(self._loc_g.keys())[:4]
+        sep    = '\\' if is_win else '/'
+        segs   = list(self._loc_g.keys())[:4]
         if segs:
-            examples = [f"  {root.rstrip(chr(92) + '/')}{sep}{s}{sep}..." for s in segs]
-            if len(self._loc_g) > 4: examples.append(f"  ... y {len(self._loc_g)-4} mas")
+            examples = [
+                f"  {root.rstrip(chr(92) + '/')}{sep}{s}{sep}..." for s in segs
+            ]
+            if len(self._loc_g) > 4:
+                examples.append(f"  ... y {len(self._loc_g)-4} mas")
             self.lbl_root_prev.setText("\n".join(examples))
         else:
             self.lbl_root_prev.setText(f"  {root}{sep}...")
@@ -554,14 +658,13 @@ class RepathApp(QMainWindow):
         root = self.root_edit.text().strip().rstrip('/\\')
         self._auto_resolved = {}
         self._clear_rows()
-        # Eliminamos el hint del layout para que no ocupe espacio
         if self._hint and self._hint.parent():
             self.scroll_layout.removeWidget(self._hint)
             self._hint.deleteLater()
             self._hint = None
 
         is_win = bool(re.match(r'[A-Za-z]:', root)) if root else sys.platform == 'win32'
-        sep = '\\' if is_win else '/'
+        sep    = '\\' if is_win else '/'
 
         pending_loc: Dict[str, List[str]] = {}
         if root:
@@ -579,7 +682,9 @@ class RepathApp(QMainWindow):
                 for seg, full in ok_segs:
                     self._out(f"  localized:{seg}/... -> {full}/...", 'orange')
             if bad_segs:
-                self._out(f"\n{len(bad_segs)} grupo(s) NO encontrados bajo la raiz:", 'warn')
+                self._out(
+                    f"\n{len(bad_segs)} grupo(s) NO encontrados bajo la raiz:", 'warn'
+                )
                 for seg in bad_segs:
                     self._out(f"  {root}{sep}{seg}  <- carpeta no encontrada", 'warn')
         else:
@@ -600,43 +705,63 @@ class RepathApp(QMainWindow):
                 bad_abs.append((pfx, paths))
 
         if ok_abs:
-            self._out(f"\n{len(ok_abs)} prefijo(s) absoluto(s) accesibles en este equipo (sin cambios):", 'ok')
+            self._out(
+                f"\n{len(ok_abs)} prefijo(s) absoluto(s) accesibles en este equipo "
+                f"(sin cambios):", 'ok'
+            )
             for pfx, paths in ok_abs:
-                self._out(f"  ✓ {pfx}  ({len(paths)} ruta(s))", 'ok')
+                self._out(f"  \u2713 {pfx}  ({len(paths)} ruta(s))", 'ok')
         if bad_abs:
-            self._out(f"\n{len(bad_abs)} prefijo(s) absoluto(s) NO accesibles -> Paso 3:", 'warn')
+            self._out(
+                f"\n{len(bad_abs)} prefijo(s) absoluto(s) NO accesibles -> Paso 3:", 'warn'
+            )
             for pfx, paths in bad_abs:
                 row = self._abs_row(pfx, paths)
                 self.scroll_layout.addWidget(row)
                 self._abs_rows.append(row)
-        
-        # Actualizamos el área de desplazamiento
+
         self.scroll_content.adjustSize()
         self.scroll_area.updateGeometry()
 
         if not self._loc_rows and not self._abs_rows:
-            lbl = QLabel("Todas las rutas han sido resueltas con la raiz comun.\nPuedes pasar directamente a Vista previa o Aplicar cambios.")
-            lbl.setStyleSheet("color: #006600;")
+            lbl = QLabel(
+                "Todas las rutas han sido resueltas con la raiz comun.\n"
+                "Puedes pasar directamente a Vista previa o Aplicar cambios."
+            )
+            lbl.setStyleSheet("color: #50fa7b;")
             self.scroll_layout.addWidget(lbl)
-            self._out("\nTodas las rutas resueltas. Pulsa Vista previa o Aplicar cambios.", 'ok')
+            self._out(
+                "\nTodas las rutas resueltas. Pulsa Vista previa o Aplicar cambios.", 'ok'
+            )
         else:
             n_pend = len(self._loc_rows) + len(self._abs_rows)
-            self._out(f"\n{n_pend} grupo(s) necesitan indicacion manual (Paso 3).", 'head')
+            self._out(
+                f"\n{n_pend} grupo(s) necesitan indicacion manual (Paso 3).", 'head'
+            )
 
         self._set_btns(True)
+
+    # ── Filas del Paso 3 ────────────────────────────────────────────────
 
     def _loc_row(self, seg, rels):
         frame = QFrame()
         frame.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
+        frame.setStyleSheet(f"QFrame {{ background-color: {_C_ROW_LOC}; }}")
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
         lbl = QLabel(f"localized:{seg}/...   ({len(rels)} ruta(s))")
-        lbl.setStyleSheet("font-weight: bold; color: #1565c0; background-color: #e3f2fd; padding: 4px;")
+        lbl.setStyleSheet(
+            "font-weight: bold; color: #8be9fd; "
+            f"background-color: {_C_ROW_LOC}; padding: 4px;"
+        )
         layout.addWidget(lbl)
         for s in rels[:3]:
             sub = QLabel(f"  {s[:80]}")
-            sub.setStyleSheet("color: #d0d0d0; font-family: monospace; padding: 0px; margin: 0px;")
+            sub.setStyleSheet(
+                "color: #b0b0b0; font-family: 'Courier New', monospace; "
+                "padding: 0px; margin: 0px;"
+            )
             sub.setContentsMargins(0, 0, 0, 0)
             sub.setFixedHeight(sub.fontMetrics().height() + 2)
             layout.addWidget(sub)
@@ -652,24 +777,32 @@ class RepathApp(QMainWindow):
         hbox.addWidget(entry, 1)
         layout.addLayout(hbox)
         frame.entry = entry
-        frame.seg = seg
+        frame.seg   = seg
         return frame
 
     def _abs_row(self, prefix, paths):
         frame = QFrame()
         frame.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
+        frame.setStyleSheet(f"QFrame {{ background-color: {_C_ROW_ABS}; }}")
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        lbl = QLabel(f"{len(paths)} ruta(s) — prefijo absoluto")
-        lbl.setStyleSheet("color: #555; background-color: #f4f4f4; padding: 4px;")
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
+        lbl = QLabel(f"{len(paths)} ruta(s) — prefijo: {prefix}")
+        lbl.setStyleSheet(
+            f"color: #f1fa8c; background-color: {_C_ROW_ABS}; padding: 4px;"
+        )
         layout.addWidget(lbl)
         for s in paths[:2]:
             sub = QLabel(f"  {s[:80]}")
-            sub.setStyleSheet("color: #d0d0d0; font-family: monospace; padding: 0px; margin: 0px;")
+            sub.setStyleSheet(
+                "color: #b0b0b0; font-family: 'Courier New', monospace; "
+                "padding: 0px; margin: 0px;"
+            )
             sub.setContentsMargins(0, 0, 0, 0)
             sub.setFixedHeight(sub.fontMetrics().height() + 2)
             layout.addWidget(sub)
+        if len(paths) > 2:
+            layout.addWidget(QLabel(f"  ... y {len(paths)-2} mas"))
         hbox = QHBoxLayout()
         orig = QLineEdit(prefix)
         orig.setReadOnly(True)
@@ -679,50 +812,66 @@ class RepathApp(QMainWindow):
         btn.clicked.connect(lambda: self._browse_abs_dir(entry))
         hbox.addWidget(btn)
         entry = QLineEdit()
-        entry.setPlaceholderText("Destino")
+        entry.setPlaceholderText("Carpeta destino")
         hbox.addWidget(entry, 1)
         layout.addLayout(hbox)
         frame.entry = entry
-        frame.orig = prefix
+        frame.orig  = prefix
         return frame
 
     def _browse_loc_dir(self, entry, seg):
         ini = entry.text().strip() or str(Path.home())
-        p = QFileDialog.getExistingDirectory(self, f'Selecciona la carpeta "{seg}"', ini)
-        if p: entry.setText(p)
+        p = QFileDialog.getExistingDirectory(
+            self, f'Selecciona la carpeta "{seg}"', ini
+        )
+        if p:
+            entry.setText(p)
 
     def _browse_abs_dir(self, entry):
         ini = entry.text().strip() or str(Path.home())
         p = QFileDialog.getExistingDirectory(self, "Selecciona carpeta destino", ini)
-        if p: entry.setText(p)
+        if p:
+            entry.setText(p)
+
+    # ── Recoleccion y ejecucion ─────────────────────────────────────────
 
     def _collect(self):
         loc_map = dict(self._auto_resolved)
         for row in self._loc_rows:
             if row.entry.text():
                 loc_map[row.seg] = row.entry.text()
-        abs_map = {r.orig: r.entry.text() for r in self._abs_rows if r.orig and r.entry.text()}
+        abs_map = {
+            r.orig: r.entry.text()
+            for r in self._abs_rows
+            if r.orig and r.entry.text()
+        }
         if not loc_map and not abs_map:
-            QMessageBox.warning(self, "Sin datos", "Indica al menos una carpeta raiz o destino.")
+            QMessageBox.warning(self, "Sin datos", "Indica al menos una carpeta destino.")
             return None
         return abs_map, loc_map
 
     def _preview(self):
         c = self._collect()
-        if c: self._run(c[0], c[1], dry_run=True, log_fn=None)
+        if c:
+            self._run(c[0], c[1], dry_run=True)
 
     def _apply_changes(self):
         c = self._collect()
-        if not c: return
+        if not c:
+            return
         assert self._qgz
         out = self._qgz.parent / (self._qgz.stem + "_repath" + self._qgz.suffix)
         if out.exists():
-            if QMessageBox.question(self, "Ya existe", f"Sobreescribir?\n{out}") != QMessageBox.StandardButton.Yes:
+            if (
+                QMessageBox.question(self, "Ya existe", f"Sobreescribir?\n{out}")
+                != QMessageBox.StandardButton.Yes
+            ):
                 return
-        self._run(c[0], c[1], dry_run=False, output=out, log_fn=None)
+        self._run(c[0], c[1], dry_run=False, output=out)
 
-    def _run(self, abs_map, loc_map, dry_run=True, output=None, log_fn=None):
-        if self._busy: return
+    def _run(self, abs_map, loc_map, dry_run=True, output=None):
+        if self._busy:
+            return
         self._busy = True
         self._log_clear()
         self._out('=' * 60)
@@ -739,11 +888,10 @@ class RepathApp(QMainWindow):
         self.btn_resolve.setEnabled(False)
 
         try:
-            def logger(msg, tag='info'):
-                self._out(msg, tag)
-            
-            process_qgz(self._qgz, abs_map, loc_map, output, dry_run, log_fn=logger)
-            
+            process_qgz(
+                self._qgz, abs_map, loc_map, output, dry_run,
+                log_fn=lambda msg, tag='info': self._out(msg, tag),
+            )
             if not dry_run and output:
                 self._out(f"\nListo. El archivo {output.name} ha sido escrito.", 'ok')
         except Exception as e:
@@ -752,21 +900,20 @@ class RepathApp(QMainWindow):
             self._done()
             self._busy = False
 
-    def _on_success(self, dry_run, output):
-        if not dry_run and output:
-            self._out(f"\nListo. El archivo {output.name} ha sido escrito.", 'ok')
+    # ── Helpers de estado ───────────────────────────────────────────────
 
     def _reset_paso2(self):
         self._auto_resolved = {}
-        self._abs_g = {}; self._loc_g = {}
+        self._abs_g = {}
+        self._loc_g = {}
         self.btn_resolve.setEnabled(False)
         self.lbl_root_prev.setText("")
 
     def _clear_rows(self):
         for r in self._abs_rows + self._loc_rows:
             r.deleteLater()
-        self._abs_rows.clear(); self._loc_rows.clear()
-        # No volvemos a mostrar el hint aquí, se maneja en _apply_root
+        self._abs_rows.clear()
+        self._loc_rows.clear()
 
     def _set_btns(self, on: bool):
         self.btn_preview.setEnabled(on)
@@ -775,16 +922,29 @@ class RepathApp(QMainWindow):
     def _done(self):
         self.progress.setVisible(False)
         self._busy = False
-        self._set_btns(bool(self._abs_rows or self._loc_rows or self._auto_resolved))
+        self._set_btns(
+            bool(self._abs_rows or self._loc_rows or self._auto_resolved)
+        )
         self.btn_analyze.setEnabled(bool(self._qgz))
         if self._loc_g or self._abs_g:
             self.btn_resolve.setEnabled(True)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── ENTRY POINT ────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def main() -> None:
     app = QApplication(sys.argv)
+
+    # Fusion garantiza colores consistentes en Windows, Linux y macOS
+    app.setStyle("Fusion")
+    app.setPalette(_dark_palette())
+
     window = RepathApp()
     window.show()
     sys.exit(app.exec())
+
 
 if __name__ == '__main__':
     main()
