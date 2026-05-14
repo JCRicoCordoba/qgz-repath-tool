@@ -27,7 +27,7 @@ class RepathToolPlugin:
                               self.iface.mainWindow())
         self.action.setToolTip(
             "Reasigna rutas de capas rotas en el proyecto actual\n"
-            "(QGZ Repath Tool v2.4)"
+            "(QGZ Repath Tool v2.8)"
         )
         self.action.triggered.connect(self.run)
 

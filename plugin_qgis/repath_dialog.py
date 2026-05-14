@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from qgis.PyQt.QtWidgets import (
+    QApplication,
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QFileDialog, QMessageBox, QTextEdit, QGroupBox, QScrollArea,
     QFrame, QWidget, QSizePolicy,
@@ -24,6 +25,7 @@ from .repath_core import (
     collect_broken_sources,
     read_project_datasources,
     repath_source,
+    find_ecw_substitute,
     _segs,
 )
 
@@ -131,7 +133,7 @@ class RepathDialog(QDialog):
     Paso 3 — Grupos que requieren asignación manual.
     """
 
-    PLUGIN_VERSION = "2.4"
+    PLUGIN_VERSION = "2.8"
 
     def __init__(self, iface, parent=None):
         super().__init__(parent)
@@ -364,9 +366,31 @@ class RepathDialog(QDialog):
         self._out(f"Proyecto: {proj_name}", 'head')
         self._out(f"Capas totales: {len(all_layers)}", 'info')
 
-        # ── Leer el XML del proyecto para recuperar los datasources originales ──
-        # En QGIS 3.x, layer.source() devuelve '' para capas localized: rotas.
-        # El source original solo existe en el XML interno del .qgz/.qgs.
+        # ── Aviso preventivo: rutas de red pueden causar esperas largas ─────
+        # Path.exists() en unidades NAS/SMB caídas espera el timeout del SO.
+        # No se implementa hilo separado (QgsTask) para mantener la simplicidad,
+        # pero se avisa al usuario si se detectan rutas de red.
+        net_prefixes = ('\\\\', '//')
+        net_layers = [
+            l for l in all_layers
+            if any(l.source().startswith(p) for p in net_prefixes)
+        ]
+        if net_layers:
+            self._out(
+                f"⚠  {len(net_layers)} capa(s) en rutas de red (UNC/SMB). "
+                "El análisis puede tardar si el servidor no responde.", 'warn'
+            )
+
+        # ── Recuperar datasources originales para capas potencialmente rotas ────
+        # Estrategia de tres niveles:
+        #   1. layer.source() / layer.publicSource()  →  se usa en _effective_source()
+        #   2. XML del proyecto en disco              →  necesario cuando QGIS 3.x
+        #      devuelve '' para capas localized: no resueltas (ni source() ni
+        #      publicSource() retornan el path original en ese caso).
+        #
+        # Riesgo conocido de leer el disco: si el usuario tiene cambios sin guardar,
+        # el ZIP refleja el estado anterior al último Ctrl+S. Por eso se avisa aquí
+        # y se exige que el proyecto esté guardado antes de analizar.
         xml_sources: Dict[str, str] = {}
         proj_file = project.fileName()
         if proj_file:
@@ -398,13 +422,15 @@ class RepathDialog(QDialog):
         n_abs   = sum(len(v) for v in abs_g.values())
         n_loc   = sum(len(v) for v in loc_g.values())
 
-        # Guardar lista plana de capas afectadas (para preview/apply)
+        # Guardar lista plana de capas afectadas (para preview/apply).
+        # Se usa lyr.id() —identificador único persistente del core de QGIS—
+        # en lugar de id(lyr) (dirección de memoria Python, que puede reciclarse).
         seen_ids: set = set()
         self._broken_layers = []
         for layers_for_src in layer_map.values():
             for lyr in layers_for_src:
-                if id(lyr) not in seen_ids:
-                    seen_ids.add(id(lyr))
+                if lyr.id() not in seen_ids:
+                    seen_ids.add(lyr.id())
                     self._broken_layers.append(lyr)
 
         if not self._broken_layers:
@@ -551,29 +577,36 @@ class RepathDialog(QDialog):
             self._loc_rows.append(row)
 
         # ── absolutas ─────────────────────────────────────────────
-        # Intentar auto-resolver absolutas con la raíz si comparten un
-        # tramo de prefijo. En la mayoría de casos irán al Paso 3.
+        # Estrategia de auto-resolución (dos pasos):
+        #   1. Si el último segmento del prefijo coincide con el nombre de la
+        #      carpeta raíz indicada, la raíz ES el nuevo prefijo (caso más común:
+        #      el usuario apunta exactamente a la carpeta homóloga).
+        #   2. Si no, buscar el sufijo del prefijo antiguo que exista como
+        #      subdirectorio bajo la raíz, de más específico a más genérico.
         ok_abs, bad_abs = [], []
         if root:
+            root_path = Path(root)
             for pfx, paths in self._abs_g.items():
-                # Comprobar si el primer archivo del grupo existe bajo la raíz
-                # buscando el prefijo equivalente dentro de root
-                sample = paths[0].replace('\\', '/')
-                segs_s = _segs(sample)
-                # Intentar reconstruir la ruta bajo root usando el último
-                # tramo de segmentos divergentes (heurística simple)
+                pfx_segs  = _segs(pfx)
                 candidate = None
-                for i in range(len(segs_s)):
-                    tail = sep.join(segs_s[i:])
-                    test = Path(root) / tail
-                    if test.exists():
-                        # Prefijo nuevo: root + todo hasta el nivel del prefijo antiguo
-                        pfx_segs  = _segs(pfx)
-                        tail_pfx  = sep.join(segs_s[i: i + len(pfx_segs)])
-                        new_pfx   = str(Path(root) / tail_pfx)
-                        candidate = new_pfx
-                        break
-                if candidate and Path(candidate).exists():
+
+                # Estrategia 1: la raíz apunta directamente al prefijo antiguo
+                # (p. ej.  E:\SIG_GIS\SIG_DATOS  →  E:\CX Sync\SIG_GIS\SIG_DATOS)
+                if (root_path.name.lower() == pfx_segs[-1].lower()
+                        and root_path.is_dir()):
+                    candidate = str(root_path)
+
+                # Estrategia 2: el prefijo o un sufijo suyo existe bajo la raíz
+                # (p. ej.  root/REDIAM  cuando el prefijo termina en REDIAM)
+                if not candidate:
+                    start_idx = 1 if re.match(r'[A-Za-z]:', pfx_segs[0]) else 0
+                    for i in range(start_idx, len(pfx_segs)):
+                        sub = root_path.joinpath(*pfx_segs[i:])
+                        if sub.is_dir():
+                            candidate = str(sub)
+                            break
+
+                if candidate:
                     self._auto_resolved['__abs__' + pfx] = (pfx, candidate)
                     ok_abs.append((pfx, paths, candidate))
                 else:
@@ -835,10 +868,23 @@ class RepathDialog(QDialog):
     # ── Vista previa ──────────────────────────────────────────────────
 
     def _effective_source(self, layer) -> str:
-        """Devuelve el datasource real de una capa: usa layer.source() si
-        no está vacío, o recurre al XML del proyecto para capas localized:
-        que QGIS no pudo resolver (devuelven '' en QGIS 3.x)."""
+        """Devuelve el datasource real de una capa.
+
+        Orden de prioridad:
+          1. ``layer.source()``    — fuente activa; siempre es la más fresca.
+          2. ``layer.publicSource()`` — fuente original sin credenciales sensibles;
+             en QGIS 3.x puede contener el path bruto de capas rotas cuando
+             ``source()`` ya devuelve '' (vacío) por no haber podido resolver la ruta.
+          3. XML del proyecto en disco (``self._xml_sources``) — último recurso,
+             necesario sobre todo para capas ``localized:`` que QGIS no resuelve
+             en absoluto: ni ``source()`` ni ``publicSource()`` devuelven nada útil.
+        """
         src = layer.source().strip()
+        if not src or src.startswith('|'):
+            # Intentar la API nativa antes de tocar disco
+            pub = layer.publicSource().strip() if hasattr(layer, 'publicSource') else ''
+            if pub and not pub.startswith('|'):
+                src = pub
         if not src or src.startswith('|'):
             src = self._xml_sources.get(layer.id(), src)
         return src
@@ -860,12 +906,25 @@ class RepathDialog(QDialog):
             self._out(f'     -> {new}', 'ok')
         self._out('═' * 62)
 
-        matched  = 0
-        no_match = 0
+        matched   = 0
+        ecw_found = 0
+        no_match  = 0
         for layer in self._broken_layers:
-            source = self._effective_source(layer)
+            source     = self._effective_source(layer)
             new_source = repath_source(source, abs_map, loc_map)
-            if new_source:
+
+            # ── Fallback ECW ──────────────────────────────────────────────
+            ecw_sub = None
+            if not new_source or not Path(new_source.split('|')[0].replace('\\', '/')).exists():
+                ecw_sub = find_ecw_substitute(source, abs_map, loc_map)
+
+            if ecw_sub:
+                self._out(f"[ECW] {layer.name()}", 'orange')
+                self._out(f"      {source[:72]}", 'warn')
+                self._out(f"   → {ecw_sub[:72]}  ✦ sustituto ECW", 'ok')
+                ecw_found += 1
+                matched += 1
+            elif new_source:
                 self._out(f"[SIM] {layer.name()}", 'orange')
                 self._out(f"      {source[:72]}", 'warn')
                 self._out(f"   → {new_source[:72]}", 'info')
@@ -874,8 +933,9 @@ class RepathDialog(QDialog):
                 self._out(f"[---] {layer.name()} — sin coincidencia ({source[:50]})", 'info')
                 no_match += 1
 
+        ecw_note = f"  |  {ecw_found} ECW→raster" if ecw_found else ""
         self._out(
-            f"\n── {matched} capa(s) actualizadas  |  {no_match} sin cambio ──",
+            f"\n── {matched} capa(s) actualizadas{ecw_note}  |  {no_match} sin cambio ──",
             'ok' if matched > 0 else 'warn'
         )
 
@@ -905,21 +965,35 @@ class RepathDialog(QDialog):
         self._out('APLICANDO CAMBIOS', 'head')
         self._out('─' * 62)
 
-        ok_count  = 0
-        err_count = 0
+        ok_count   = 0
+        ecw_count  = 0
+        err_count  = 0
         skip_count = 0
 
         options = QgsDataProvider.ProviderOptions()
 
         for layer in self._broken_layers:
+            # Liberar el event loop en cada iteración para que la UI no se congele
+            # si la comprobación de existencia de archivos tarda (rutas de red lentas).
+            QApplication.processEvents()
+
             source     = self._effective_source(layer)
             new_source = repath_source(source, abs_map, loc_map)
+
+            # ── Fallback ECW ──────────────────────────────────────────────
+            ecw_used = False
+            if not new_source or not Path(new_source.split('|')[0].replace('\\', '/')).exists():
+                ecw_sub = find_ecw_substitute(source, abs_map, loc_map)
+                if ecw_sub:
+                    new_source = ecw_sub
+                    ecw_used   = True
 
             if not new_source:
                 self._out(f"[---] {layer.name()} — sin coincidencia", 'info')
                 skip_count += 1
                 continue
 
+            ecw_tag = "  ✦ ECW→raster" if ecw_used else ""
             try:
                 layer.setDataSource(
                     new_source,
@@ -928,15 +1002,22 @@ class RepathDialog(QDialog):
                     options,
                 )
                 if layer.isValid():
-                    self._out(f"[OK]  {layer.name()}", 'ok')
+                    self._out(f"[OK]  {layer.name()}{ecw_tag}", 'ok')
                     self._out(f"      {new_source[:72]}", 'info')
                     ok_count += 1
+                    if ecw_used:
+                        ecw_count += 1
+                    # Disparar repintado para que la ToC actualice el icono de capa rota
+                    layer.triggerRepaint()
                 else:
                     # Intentar sin QgsDataProvider.ProviderOptions (compatibilidad)
                     layer.setDataSource(new_source, layer.name(), layer.providerType())
                     if layer.isValid():
-                        self._out(f"[OK]  {layer.name()}", 'ok')
+                        self._out(f"[OK]  {layer.name()}{ecw_tag}", 'ok')
                         ok_count += 1
+                        if ecw_used:
+                            ecw_count += 1
+                        layer.triggerRepaint()
                     else:
                         self._out(
                             f"[ERR] {layer.name()} — no válida tras reasignar", 'error'
@@ -948,18 +1029,21 @@ class RepathDialog(QDialog):
                 err_count += 1
 
         self._out('─' * 62)
+        ecw_note = f"  |  {ecw_count} ECW→raster" if ecw_count else ""
         self._out(
-            f"── {ok_count} reconectada(s)  |  "
+            f"── {ok_count} reconectada(s){ecw_note}  |  "
             f"{err_count} error(es)  |  {skip_count} sin cambio ──",
             'ok' if err_count == 0 and ok_count > 0 else 'warn'
         )
 
         if ok_count > 0:
-            # Refrescar canvas
-            try:
-                self.iface.mapCanvas().refresh()
-            except Exception:
-                pass
+            # Notificar a QGIS que el proyecto tiene cambios sin guardar.
+            # Sin esto, al cerrar QGIS no aparece el diálogo de guardar.
+            QgsProject.instance().setDirty(True)
+
+            # Refrescar el canvas. En QGIS 3.x el método es refresh().
+            # (refreshAllLayers() era de QGIS 2.x y ya no existe.)
+            self.iface.mapCanvas().refresh()
             self._out(
                 "\nCanvas actualizado. Guarda el proyecto con Ctrl+S.", 'ok'
             )
