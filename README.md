@@ -9,10 +9,10 @@ Herramienta para reasignar rutas de capas en proyectos QGIS (`.qgz` / `.qgs`) tr
 
 Disponible en dos formatos:
 
-| Formato | Archivo | Cuándo usarlo |
+| Formato | Carpeta en el repo | Cuándo usarlo |
 |---|---|---|
-| **Script standalone** | `repath.py` | Sin QGIS instalado, o para procesar archivos en lote |
-| **Plugin QGIS** | carpeta `qgz_repath_tool/` | Con el proyecto ya abierto en QGIS |
+| **Script standalone** | `script_original/` | Sin QGIS instalado, o para procesar archivos en lote |
+| **Plugin QGIS** | `plugin_qgis/` | Con el proyecto ya abierto en QGIS |
 
 ---
 
@@ -20,7 +20,7 @@ Disponible en dos formatos:
 
 QGIS almacena la ubicación de cada capa en el XML interno del proyecto (nodo `<datasource>`). Cuando los datos se mueven a otro disco, servidor o sistema operativo, esas rutas quedan rotas y el proyecto no carga las capas. QGIS ofrece reparación manual capa a capa, lo que resulta inviable con decenas o cientos de capas.
 
-QGZ Repath Tool detecta qué rutas están rotas, las agrupa por prefijo común y permite reasignarlas en bloque en segundos.
+QGZ Repath Tool detecta qué rutas están rotas, las agrupa por prefijo común y permite reasignarlas en bloque en segundos. Para capas raster originalmente en formato `.ecw` que han sido convertidas a otro formato (`.tif`, `.jpg`, `.png`…), la herramienta las detecta y reconecta automáticamente sin intervención adicional.
 
 ---
 
@@ -32,6 +32,7 @@ QGZ Repath Tool detecta qué rutas están rotas, las agrupa por prefijo común y
 - **Auto-resolución por carpeta raíz común** — si la mayoría de las rutas comparten una carpeta madre, indicarla en el Paso 2 resuelve automáticamente todo lo que sea posible.
 - **Agrupación inteligente por rama divergente** — cuando las rutas tienen distintas subcarpetas bajo un prefijo común, la herramienta las separa en grupos independientes con el prefijo más profundo posible para cada uno, evitando asignaciones ambiguas y rutas con subcarpetas duplicadas.
 - **Resolución manual de grupos pendientes** — los grupos que no se resolvieron automáticamente aparecen en el Paso 3 con un selector de carpeta.
+- **Fallback automático ECW → raster** — para archivos `.ecw` que ya no existen pero cuyo equivalente en otro formato raster sí está presente en el directorio de destino, la herramienta encuentra y asigna el sustituto automáticamente.
 - **Vista previa no destructiva** — simula los cambios en el log antes de escribir nada.
 - **Compatibilidad multiplataforma** — normaliza separadores (`/` ↔ `\`) según el sistema operativo de destino.
 - **Compatibilidad `.qgs`** — funciona también con proyectos en formato XML plano (sin comprimir).
@@ -53,14 +54,14 @@ QGZ Repath Tool detecta qué rutas están rotas, las agrupa por prefijo común y
 
 ```bash
 # 1. Clonar el repositorio
-git clone https://github.com/usuario/qgz-repath-tool.git
+git clone https://github.com/JCRicoCordoba/qgz-repath-tool.git
 cd qgz-repath-tool
 
 # 2. Instalar la dependencia de interfaz
 pip install PySide6
 
 # 3. Ejecutar
-python repath.py
+python script_original/repath.py
 ```
 
 Con conda:
@@ -68,7 +69,7 @@ Con conda:
 ```bash
 conda activate mi_entorno
 pip install PySide6
-python repath.py
+python script_original/repath.py
 ```
 
 ### Uso
@@ -92,7 +93,7 @@ Los grupos que no pudieron resolverse aparecen listados con una muestra de sus r
 
 ---
 
-## Plugin QGIS (`qgz_repath_tool/`)
+## Plugin QGIS (`plugin_qgis/`)
 
 Replica el comportamiento completo del script directamente dentro de QGIS. No es necesario salir de la aplicación ni manipular el `.qgz` manualmente: el plugin actúa sobre el proyecto abierto en vivo.
 
@@ -129,10 +130,10 @@ No se necesitan dependencias adicionales.
 
 ### Instalación directa (recomendada durante desarrollo)
 
-Copia la carpeta `qgz_repath_tool/` al directorio de plugins de usuario:
+Clona el repositorio y copia la carpeta `plugin_qgis/` al directorio de plugins de usuario **renombrándola** como `qgz_repath_tool/` (QGIS requiere que el nombre de la carpeta coincida con el nombre del módulo Python):
 
-- **Linux / macOS:** `~/.local/share/QGIS/QGIS3/profiles/default/python/plugins/`
-- **Windows:** `%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\`
+- **Linux / macOS:** `~/.local/share/QGIS/QGIS3/profiles/default/python/plugins/qgz_repath_tool/`
+- **Windows:** `%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\qgz_repath_tool\`
 
 Después activa el plugin desde el gestor de plugins de QGIS.
 
@@ -178,6 +179,22 @@ Ejemplo: rutas bajo `/media/Datos/RiMo/`, `/media/Datos/SIG_GIS/` y `/media/Dato
 
 Se extrae la parte relativa tras `localized:` y se agrupa por primer segmento (`group_localized()`). Al resolver, se concatena la nueva ruta base con los segmentos relativos restantes, preservando los sufijos de capa (`|layername=…`, `|layerid=…`).
 
+### Fallback ECW → raster (`find_ecw_substitute`)
+
+Cuando una ruta con extensión `.ecw` no puede resolverse (porque el archivo `.ecw` ya no existe en el destino, habitualmente por conversión a otro formato), la función `find_ecw_substitute()` busca automáticamente un archivo con el mismo nombre pero con extensión raster alternativa. Las extensiones se prueban en este orden de preferencia:
+
+`.tif` › `.tiff` › `.jpg` › `.jpeg` › `.png` › `.img` › `.vrt` › `.sid` › `.adf`
+
+La búsqueda se realiza en el directorio al que apuntaría la ruta remapeada y, como alternativa, en todas las raíces de destino configuradas en los pasos 2 y 3. Si se encuentra un sustituto, se usa directamente sin que el usuario tenga que intervenir. En el log aparece marcado como `[ECW] ✦ sustituto ECW` en la vista previa, y como `[OK] ✦ ECW→raster` al aplicar.
+
+Ejemplo típico:
+
+```
+/datos_antiguos/ortofotos/vuelo2018.ecw
+          ↓  (convertido a GeoTIFF, mismo nombre)
+/datos_nuevos/ortofotos/vuelo2018.tif   ← encontrado y asignado automáticamente
+```
+
 ### Detección en QGIS 3.x (plugin)
 
 En QGIS 3.x, cuando una capa con ruta `localized:` no puede resolverse, `layer.source()` devuelve cadena vacía en lugar del datasource original. `read_project_datasources()` lee el XML interno del `.qgz` para recuperar el datasource real `{layer_id → datasource}`, y `_effective_source()` lo usa como fallback cuando `layer.source()` está vacío o es solo un sufijo `|layername=…`.
@@ -204,22 +221,27 @@ En QGIS 3.x, cuando una capa con ruta `localized:` no puede resolverse, `layer.s
 | «Sin datos» al pulsar Vista previa | La carpeta de destino está escrita pero el campo «Segmento localized:» está vacío (fila manual) | Rellena ambos campos o usa el Paso 2 con la carpeta raíz |
 | Capas reconectadas pero sin renderizar | El canvas no se refrescó | El plugin llama a `iface.mapCanvas().refresh()` automáticamente; si no basta, cierra y reabre el panel de capas |
 | Las capas siguen rotas tras aplicar | La ruta asignada no existe o el proveedor no la reconoce | Usar **Vista previa** para verificar la ruta exacta antes de aplicar; comprobar que la carpeta seleccionada es la correcta |
+| Un `.ecw` no se reconecta aunque existe un `.tif` equivalente | La carpeta de destino no coincide con la configurada en pasos 2/3 | Verificar en **Vista previa** que la ruta destino es la correcta; el fallback ECW busca solo en los directorios de destino indicados |
 
 ---
 
 ## Estructura del repositorio
 
 ```
-├── repath.py               # Script standalone (PySide6)
-├── repath.md               # Documentación del script
-├── qgz_repath_tool/        # Plugin QGIS
+├── plugin_qgis/            # Plugin QGIS (fuente del módulo)
 │   ├── __init__.py
 │   ├── metadata.txt
 │   ├── plugin.py           # Punto de entrada del plugin
 │   ├── repath_core.py      # Lógica pura (sin Qt)
 │   └── repath_dialog.py    # Diálogo Qt (PyQt5)
+├── script_original/        # Script standalone (PySide6)
+│   └── repath.py
+├── .gitignore
+├── LICENSE
 └── README.md
 ```
+
+> ⚠️ La carpeta `plugin_qgis/` contiene el código fuente del plugin pero **debe instalarse con el nombre `qgz_repath_tool/`** en QGIS, ya que ese es el nombre del módulo Python declarado en `metadata.txt`. Ver instrucciones de instalación más abajo.
 
 `repath_core.py` no depende de Qt y es compartido conceptualmente por ambos formatos: el script usa sus funciones de clasificación y agrupación; el plugin las usa directamente al importar el módulo.
 
@@ -227,7 +249,18 @@ En QGIS 3.x, cuando una capa con ruta `localized:` no puede resolverse, `layer.s
 
 ## Cambios por versión
 
-### v2.4 (plugin)
+### v2.8
+- **Fix lectura de datasources en proyecto no guardado** — `_effective_source()` ahora intenta `layer.publicSource()` antes de recurrir al XML del disco, lo que evita leer datos obsoletos cuando el proyecto tiene cambios sin guardar y la API nativa puede responder.
+- **Fix congelación de GUI con rutas lentas** — `QApplication.processEvents()` en el bucle de `_apply_changes` libera el event loop en cada iteración, evitando que rutas UNC/SMB con timeout largo congelen QGIS.
+- **Fix `refreshAllLayers()` obsoleto** — reemplazado por `QgsMapCanvas.refresh()`, el método correcto en QGIS 3.x. El `try/except AttributeError` era código muerto desde la versión mínima 3.16.
+- **Mejora ToC tras reconexión** — se llama a `layer.triggerRepaint()` después de `setDataSource()` exitoso para que la Tabla de Contenidos actualice inmediatamente el icono de capa rota sin esperar al siguiente repintado global.
+- **VFS cloud completos** — añadidos `/vsis3/`, `/vsigs/`, `/vsiaz/`, `/vsicurl_streaming/`, `/vsioss/`, `/vsiswift/`, `/vsiadls/` a `_SERVICES` para que las capas almacenadas en la nube (AWS S3, Google Cloud Storage, Azure) se ignoren correctamente en el análisis.
+- **Deduplicación de directorios más limpia** — refactorizado el bucle de deduplicación en `find_ecw_substitute` a un dict comprehension que preserva el case real de la ruta mientras compara en minúsculas.
+
+### v2.5
+- **Fallback ECW → raster** — `find_ecw_substitute()` detecta automáticamente archivos `.ecw` sin sustituto directo e intenta reasignarlos al equivalente con extensión raster alternativa (`.tif`, `.tiff`, `.jpg`, `.jpeg`, `.png`, `.img`, `.vrt`, `.sid`, `.adf`) que exista en el directorio de destino. El log identifica estas sustituciones con la etiqueta `✦ ECW→raster` y el resumen final incluye su conteo separado.
+
+### v2.4
 - **Plugin QGIS nuevo** — replica el flujo completo del script como plugin nativo, aplicando cambios en vivo vía `setDataSource()`.
 - **Fix detección QGIS 3.x** — `read_project_datasources()` lee el XML del `.qgz` para recuperar datasources originales cuando `layer.source()` devuelve cadena vacía (comportamiento de QGIS 3.16+ con rutas `localized:` no resueltas).
 - **Fix agrupación unix** — `_group_unix_paths()` reemplaza la agrupación global por agrupación por rama divergente, evitando subcarpetas duplicadas en la salida.
@@ -243,7 +276,7 @@ En QGIS 3.x, cuando una capa con ruta `localized:` no puede resolverse, `layer.s
 Las contribuciones son bienvenidas. Para reportar un error, incluye en el issue:
 
 - Versión de QGIS y sistema operativo
-- Tipo de rutas afectadas (absolutas Windows, Unix, `localized:`)
+- Tipo de rutas afectadas (absolutas Windows, Unix, `localized:`, `.ecw`)
 - Fragmento del log de la herramienta (panel derecho del diálogo)
 
 Para proponer mejoras, abre un Pull Request con descripción del cambio y, si aplica, un proyecto `.qgz` de prueba mínimo sin datos reales.
