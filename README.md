@@ -1,288 +1,117 @@
 # QGZ Repath Tool
 
-![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
-![QGIS](https://img.shields.io/badge/QGIS-3.16%2B-41a42a)
-![Plataforma](https://img.shields.io/badge/Plataforma-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
-![Licencia](https://img.shields.io/badge/Licencia-MIT-green)
+**Plugin de QGIS para reconectar capas con rutas rotas mediante búsqueda inversa.**
 
-Herramienta para reasignar rutas de capas en proyectos QGIS (`.qgz` / `.qgs`) tras cambiar de equipo, reorganizar carpetas o migrar entre sistemas operativos.
+Cuando abres un proyecto `.qgz` / `.qgs` en un equipo distinto al que lo creó (otra unidad, otra estructura de carpetas, otro sistema operativo), las capas aparecen rotas porque las rutas absolutas ya no existen. Este plugin las reconecta en vivo, sin cerrar QGIS ni manipular el archivo del proyecto en disco.
 
-Disponible en dos formatos:
-
-| Formato | Carpeta en el repo | Cuándo usarlo |
-|---|---|---|
-| **Script standalone** | `script_original/` | Sin QGIS instalado, o para procesar archivos en lote |
-| **Plugin QGIS** | `plugin_qgis/` | Con el proyecto ya abierto en QGIS |
+![QGIS 3.16+](https://img.shields.io/badge/QGIS-3.16%2B-green)
+![Versión](https://img.shields.io/badge/versi%C3%B3n-4.0-orange)
+![Licencia](https://img.shields.io/badge/licencia-GPL--2.0-blue)
 
 ---
 
-## El problema que resuelve
+## La idea: búsqueda inversa
 
-QGIS almacena la ubicación de cada capa en el XML interno del proyecto (nodo `<datasource>`). Cuando los datos se mueven a otro disco, servidor o sistema operativo, esas rutas quedan rotas y el proyecto no carga las capas. QGIS ofrece reparación manual capa a capa, lo que resulta inviable con decenas o cientos de capas.
+Las rutas rotas entre equipos **difieren por el principio y coinciden por el final**:
 
-QGZ Repath Tool detecta qué rutas están rotas, las agrupa por prefijo común y permite reasignarlas en bloque en segundos. Para capas raster originalmente en formato `.ecw` que han sido convertidas a otro formato (`.tif`, `.jpg`, `.png`…), la herramienta las detecta y reconecta automáticamente sin intervención adicional.
+```
+Equipo origen:   E:/IA/2024/1224U004_PGOM_Villafranca/00_DATOS/A4_MEJORA/SIG/1.ecw
+Este equipo:     E:/RICOco/2401_PGOM_POU_Villafranca/00_DATOS/A4_MEJORA/SIG/1.ecw
+                 └────────── difiere ──────────────┘└──────── coincide ────────┘
+```
 
----
+En lugar de intentar adivinar qué carpeta de la ruta vieja es significativa (el enfoque clásico de "anclajes", frágil y propenso a falsos positivos), el plugin hace lo contrario:
 
-## Características comunes (script y plugin)
+1. **Indexa el disco una sola vez** bajo la carpeta que tú indiques, registrando únicamente los archivos cuyo nombre coincide con alguna capa rota.
+2. **Compara cada ruta rota con sus candidatos leyendo los segmentos desde el final hacia el principio.** El candidato con más carpetas finales coincidentes gana.
+3. La "carpeta común" entre ambos equipos **emerge sola de la comparación** — nadie tiene que conocerla de antemano.
 
-- **Detección automática de rutas rotas** — distingue rutas absolutas accesibles en el equipo actual de las que están rotas, y solo presenta estas últimas para corrección.
-- **Soporte de rutas `localized:`** — gestiona el espacio de nombres relativo que generan algunos flujos de trabajo de QGIS, resolviendo grupos enteros a partir de su carpeta raíz.
-- **Lectura del XML interno** — extrae los datasources originales directamente del `.qgz`, lo que garantiza la detección incluso cuando QGIS 3.x devuelve cadena vacía para capas `localized:` no resueltas.
-- **Auto-resolución por carpeta raíz común** — si la mayoría de las rutas comparten una carpeta madre, indicarla en el Paso 2 resuelve automáticamente todo lo que sea posible.
-- **Agrupación inteligente por rama divergente** — cuando las rutas tienen distintas subcarpetas bajo un prefijo común, la herramienta las separa en grupos independientes con el prefijo más profundo posible para cada uno, evitando asignaciones ambiguas y rutas con subcarpetas duplicadas.
-- **Resolución manual de grupos pendientes** — los grupos que no se resolvieron automáticamente aparecen en el Paso 3 con un selector de carpeta.
-- **Fallback automático ECW → raster** — para archivos `.ecw` que ya no existen pero cuyo equivalente en otro formato raster sí está presente en el directorio de destino, la herramienta encuentra y asigna el sustituto automáticamente.
-- **Vista previa no destructiva** — simula los cambios en el log antes de escribir nada.
-- **Compatibilidad multiplataforma** — normaliza separadores (`/` ↔ `\`) según el sistema operativo de destino.
-- **Compatibilidad `.qgs`** — funciona también con proyectos en formato XML plano (sin comprimir).
+En el ejemplo anterior, `1.ecw` aparece en el índice y el candidato correcto gana porque comparte el sufijo `00_DATOS/A4_MEJORA/SIG/1.ecw` (3 carpetas de profundidad). Da igual que la carpeta `IA` no exista en este equipo.
 
----
+## Características
 
-## Script standalone (`repath.py`)
+- **Rutas `localized:`** — Gestiona tanto las rutas `localized:` puras (que QGIS no puede resolver y devuelve vacías; se recuperan leyendo el XML interno del `.qgz`) como el fragmento `localized:` incrustado en mitad de rutas absolutas.
+- **Fallback ECW** — Si el `.ecw` original no existe, busca el mismo nombre con extensión raster alternativa (`.tif`, `.jp2`, `.png`…).
+- **Carpetas `*_gpkg` (DERA)** — Si la fuente apunta a una carpeta tipo `3_Hidrografia_gpkg`, localiza el `.gpkg` correspondiente en su interior.
+- **Versiones renombradas** — Las fuentes de referencia (REDIAM, IGN, IECA…) se actualizan cambiando el sufijo numérico (`Vias_Pecuarias_2025_03` → `_2026_01`). El plugin detecta el mismo *stem* base y elige la versión más reciente, con ordenación correcta entre años (`(2025, 9) < (2026, 1)`).
+- **Separadores mixtos** — Tolera las rutas con mezcla de `/` y `\` que QGIS Windows genera en proyectos compartidos.
+- **Comparación insensible a mayúsculas** — `Aguas` y `AGUAS` coinciden.
+- **Sufijo OGR preservado** — `|layername=...` se conserva siempre.
+- **Proveedor correcto al reconectar** — Deduce `ogr` / `gdal` por la extensión del destino (imprescindible para capas que eran `localized:`).
+- **Seguro por diseño** — Todos los candidatos proceden de un recorrido real del disco: es imposible asignar una ruta que no exista. Las ambigüedades reales (dos archivos idénticos con el mismo sufijo) nunca se resuelven solas: se te presenta un desplegable para elegir.
+- **No congela QGIS** — El escaneo se ejecuta en un hilo separado, con progreso y botón de cancelar.
 
-### Requisitos
+## Instalación
 
-| Componente | Versión mínima |
-|---|---|
-| Python | 3.9 |
-| PySide6 | 6.4 |
+1. Descarga `qgz_repath_tool_v4_0.zip` desde [Releases](../../releases).
+2. En QGIS: **Complementos → Administrar e instalar complementos → Instalar a partir de ZIP**.
+3. Aparece un botón en la barra de herramientas y una entrada en el menú *Complementos*.
 
-> El núcleo de procesamiento usa exclusivamente módulos de la biblioteca estándar (`re`, `zipfile`, `pathlib`). PySide6 es necesario solo para la interfaz gráfica.
+Requiere QGIS 3.16 o superior. Sin dependencias externas.
 
-### Instalación
+## Uso
+
+El flujo completo son 3 pasos en una sola ventana:
+
+| Paso | Qué hace |
+|------|----------|
+| **1 — Análisis** | Automático al abrir. Lista las capas rotas del proyecto (absolutas inexistentes y `localized:` sin resolver). |
+| **2 — Carpeta de búsqueda** | Indica dónde están los datos en *este* equipo. Puede ser muy general (`/media/Datos`, `E:\`) — admite varias carpetas separadas por `;`. Pulsa **Buscar coincidencias**. |
+| **3 — Revisión y aplicación** | Tabla con cada capa: ruta vieja, ruta encontrada y nº de carpetas coincidentes. Las ambiguas muestran un desplegable; las no encontradas, un botón *Buscar…* manual. Pulsa **Aplicar** y guarda el proyecto con `Ctrl+S`. |
+
+Los cambios se aplican mediante `setDataSource()` sobre el proyecto abierto: el `.qgz` en disco no se modifica hasta que tú guardas.
+
+### Consejo de carpeta de búsqueda
+
+Cuanto más concreta sea la carpeta, más rápido el escaneo; cuanto más general, más capas resolverá de una sola vez. Para discos grandes con muchos datos, empezar por la carpeta de SIG (`.../SIG_DATOS`, `E:\RICOco`…) suele resolver casi todo en segundos.
+
+## Arquitectura
+
+```
+qgz_repath_tool/
+├── __init__.py        # Punto de entrada QGIS (classFactory)
+├── metadata.txt       # Metadatos del plugin
+├── plugin.py          # Ciclo de vida: initGui / unload / run
+├── repath_core.py     # Lógica pura, sin Qt: índice, emparejamiento, fallbacks
+└── repath_dialog.py   # Interfaz Qt: 3 pasos, tabla, log, hilo de escaneo
+```
+
+`repath_core.py` no importa Qt ni QGIS (salvo los objetos capa que recibe), por lo que es usable como librería desde scripts o tests.
+
+### Funciones principales (`repath_core.py`)
+
+| Función | Descripción |
+|---------|-------------|
+| `collect_broken(layers, xml)` | Detecta las capas rotas del proyecto |
+| `read_project_datasources(path)` | Lee el XML del `.qgz` para recuperar datasources `localized:` |
+| `wanted_names(broken)` | Nombres a buscar: exactos, variantes ECW/`_gpkg`, *stems* de versión |
+| `build_index(roots, wanted)` | Recorre el disco e indexa solo los nombres relevantes |
+| `suffix_depth(segs, candidato)` | Nº de carpetas coincidentes leyendo desde el final |
+| `match_all(broken, index)` | Empareja todas las capas contra el índice |
+| `resolve_dir_candidate(path)` | Carpeta `*_gpkg` → archivo `.gpkg` interno |
+| `provider_for(source)` | Proveedor QGIS adecuado (`ogr`/`gdal`) por extensión |
+
+## Tests
+
+El núcleo tiene una batería de tests que reproduce los casos reales que motivaron el plugin (rutas `localized:` incrustadas, migración `IA` → `RICOco`, carpetas DERA, versiones renombradas, empates, nombres genéricos tipo `1.ecw`):
 
 ```bash
-# 1. Clonar el repositorio
-git clone https://github.com/JCRicoCordoba/qgz-repath-tool.git
-cd qgz-repath-tool
-
-# 2. Instalar la dependencia de interfaz
-pip install PySide6
-
-# 3. Ejecutar
-python script_original/repath.py
+python3 test_core.py
 ```
 
-Con conda:
+No requieren QGIS instalado (las capas se simulan con un *fake*).
 
-```bash
-conda activate mi_entorno
-pip install PySide6
-python script_original/repath.py
-```
+## Historia
 
-### Uso
-
-**Paso 1 — Seleccionar el proyecto**
-
-Pulsa **Examinar...** para seleccionar el archivo `.qgz` o `.qgs`. A continuación pulsa **Analizar**. El log mostrará cuántas rutas absolutas y `localized:` contiene el proyecto, indicando con ✓/✗ cuáles son accesibles en el equipo actual.
-
-**Paso 2 — Carpeta raíz común (opcional)**
-
-Si la mayoría de las rutas comparten una carpeta raíz (por ejemplo `SIG_DATOS` o `/media/Datos/SIG_GIS`), indícala aquí y pulsa **Aplicar raíz**. La herramienta resolverá automáticamente todos los grupos que encuentre bajo esa carpeta.
-
-**Paso 3 — Rutas pendientes de resolución manual**
-
-Los grupos que no pudieron resolverse aparecen listados con una muestra de sus rutas. Usa **Examinar...** para seleccionar la carpeta de destino en el equipo actual.
-
-**Vista previa y aplicar**
-
-- **Vista previa** — simula las sustituciones en el log sin escribir nada a disco.
-- **Aplicar cambios** — genera `<nombre>_repath.qgz` en el mismo directorio del original. El proyecto original no se modifica.
-
----
-
-## Plugin QGIS (`plugin_qgis/`)
-
-Replica el comportamiento completo del script directamente dentro de QGIS. No es necesario salir de la aplicación ni manipular el `.qgz` manualmente: el plugin actúa sobre el proyecto abierto en vivo.
-
-### Requisitos
-
-| Componente | Versión mínima |
-|---|---|
-| QGIS | 3.16 |
-| Python | 3.9 (incluido con QGIS) |
-
-No se necesitan dependencias adicionales.
-
-### Instalación desde ZIP
-
-1. Descarga o genera el archivo `qgz_repath_tool.zip` asegurándote de que su estructura interna sea:
-
-   ```
-   qgz_repath_tool.zip
-   └── qgz_repath_tool/
-       ├── __init__.py
-       ├── metadata.txt
-       ├── plugin.py
-       ├── repath_core.py
-       └── repath_dialog.py
-   ```
-
-   > ⚠️ El ZIP debe contener **una sola carpeta raíz** con nombre de módulo Python válido (sin espacios, sin barras). Si el ZIP tiene carpetas anidadas o un nombre con caracteres especiales, QGIS lo rechazará con el error `No module named '...'`.
-
-2. En QGIS: **Plugins → Administrar e instalar plugins → Instalar desde ZIP**.
-
-3. Selecciona `qgz_repath_tool.zip` y pulsa **Instalar plugin**.
-
-4. Activa el plugin desde **Plugins → Instalados → QGZ Repath Tool**.
-
-### Instalación directa (recomendada durante desarrollo)
-
-Clona el repositorio y copia la carpeta `plugin_qgis/` al directorio de plugins de usuario **renombrándola** como `qgz_repath_tool/` (QGIS requiere que el nombre de la carpeta coincida con el nombre del módulo Python):
-
-- **Linux / macOS:** `~/.local/share/QGIS/QGIS3/profiles/default/python/plugins/qgz_repath_tool/`
-- **Windows:** `%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\qgz_repath_tool\`
-
-Después activa el plugin desde el gestor de plugins de QGIS.
-
-### Uso
-
-El plugin se lanza desde **Plugins → QGZ Repath Tool → Reparar rutas rotas** o desde el icono en la barra de herramientas. El flujo de tres pasos es idéntico al del script, con estas diferencias:
-
-- **Paso 1** — El proyecto ya está abierto; el plugin analiza automáticamente sus capas al abrirse y muestra cuántas tienen rutas que necesitan remapeo. Pulsa **Reanalizar proyecto** si cambias de proyecto sin cerrar el diálogo.
-- **Pasos 2 y 3** — Idénticos al script.
-- **Aplicar cambios** — En lugar de generar un nuevo `.qgz`, los cambios se aplican en vivo mediante `layer.setDataSource()`. Guarda el proyecto con **Ctrl+S** después de aplicar.
-
-### Diferencias técnicas respecto al script
-
-| Script `repath.py` | Plugin QGIS |
-|---|---|
-| Abre y parsea el `.qgz` manualmente | Lee el XML del proyecto via `QgsProject` + lectura directa del `.qgz` |
-| Genera `*_repath.qgz` nuevo | Aplica `layer.setDataSource()` en vivo |
-| PySide6 | PyQt5 (bundled con QGIS) |
-| `QMainWindow` | `QDialog` lanzado desde menú |
-
----
-
-## Lógica interna (`repath_core.py`)
-
-El módulo `repath_core.py` no importa Qt y puede usarse como librería desde ambos contextos.
-
-### Clasificación de rutas
-
-`_classify()` analiza cada datasource:
-
-- Protocolos de servicio (`http://`, `postgres:`, `wms:`, `/vsicurl/`…) → **ignorado**
-- Prefijo `localized:` → **grupo localized**
-- Ruta absoluta Windows (`C:\…`) o Unix (`/ruta/…`) → **grupo absoluto**
-- Resto → **ignorado**
-
-### Agrupación por rama divergente
-
-Las rutas absolutas se agrupan por letra de unidad en Windows. En Linux/macOS, `_group_unix_paths()` calcula el prefijo común global y, si en el nivel siguiente existen segmentos distintos (ramas divergentes), divide recursivamente en subgrupos. Cada subgrupo recibe el prefijo más profundo posible.
-
-Ejemplo: rutas bajo `/media/Datos/RiMo/`, `/media/Datos/SIG_GIS/` y `/media/Datos/CXSync/` generan **tres filas** en el Paso 3 en lugar de una sola con el prefijo corto `/media/Datos`. Esto evita que una asignación demasiado genérica produzca subcarpetas duplicadas en la ruta de salida.
-
-### Rutas `localized:`
-
-Se extrae la parte relativa tras `localized:` y se agrupa por primer segmento (`group_localized()`). Al resolver, se concatena la nueva ruta base con los segmentos relativos restantes, preservando los sufijos de capa (`|layername=…`, `|layerid=…`).
-
-### Fallback ECW → raster (`find_ecw_substitute`)
-
-Cuando una ruta con extensión `.ecw` no puede resolverse (porque el archivo `.ecw` ya no existe en el destino, habitualmente por conversión a otro formato), la función `find_ecw_substitute()` busca automáticamente un archivo con el mismo nombre pero con extensión raster alternativa. Las extensiones se prueban en este orden de preferencia:
-
-`.tif` › `.tiff` › `.jpg` › `.jpeg` › `.png` › `.img` › `.vrt` › `.sid` › `.adf`
-
-La búsqueda se realiza en el directorio al que apuntaría la ruta remapeada y, como alternativa, en todas las raíces de destino configuradas en los pasos 2 y 3. Si se encuentra un sustituto, se usa directamente sin que el usuario tenga que intervenir. En el log aparece marcado como `[ECW] ✦ sustituto ECW` en la vista previa, y como `[OK] ✦ ECW→raster` al aplicar.
-
-Ejemplo típico:
-
-```
-/datos_antiguos/ortofotos/vuelo2018.ecw
-          ↓  (convertido a GeoTIFF, mismo nombre)
-/datos_nuevos/ortofotos/vuelo2018.tif   ← encontrado y asignado automáticamente
-```
-
-### Detección en QGIS 3.x (plugin)
-
-En QGIS 3.x, cuando una capa con ruta `localized:` no puede resolverse, `layer.source()` devuelve cadena vacía en lugar del datasource original. `read_project_datasources()` lee el XML interno del `.qgz` para recuperar el datasource real `{layer_id → datasource}`, y `_effective_source()` lo usa como fallback cuando `layer.source()` está vacío o es solo un sufijo `|layername=…`.
-
----
-
-## Troubleshooting
-
-### Script standalone
-
-| Síntoma | Causa probable | Solución |
-|---|---|---|
-| 0 rutas detectadas tras analizar | El proyecto usa rutas relativas puras o solo servicios WMS/WFS | No hay rutas que reasignar; el proyecto ya es portátil |
-| Subcarpetas duplicadas en la ruta de salida | Versión ≤ 2.3 con agrupación unix global | Actualizar a v2.4+ |
-| El archivo `_repath.qgz` no carga en QGIS | Una ruta fue asignada incorrectamente | Usar **Vista previa** antes de aplicar |
-| `ModuleNotFoundError: PySide6` | PySide6 no instalado en el entorno activo | `pip install PySide6` |
-
-### Plugin QGIS
-
-| Síntoma | Causa probable | Solución |
-|---|---|---|
-| Error `No module named 'X/Y'` al instalar | ZIP con doble carpeta anidada o nombre con caracteres especiales | El ZIP debe tener una sola carpeta raíz llamada `qgz_repath_tool` |
-| El plugin detecta 0 rutas pese a haber capas rotas | Comportamiento de QGIS 3.x: `layer.source()` devuelve `''` para capas `localized:` no resueltas | El proyecto debe estar **guardado en disco** para que el plugin lea el XML original. Guarda el proyecto y pulsa **Reanalizar proyecto** |
-| «Sin datos» al pulsar Vista previa | La carpeta de destino está escrita pero el campo «Segmento localized:» está vacío (fila manual) | Rellena ambos campos o usa el Paso 2 con la carpeta raíz |
-| Capas reconectadas pero sin renderizar | El canvas no se refrescó | El plugin llama a `iface.mapCanvas().refresh()` automáticamente; si no basta, cierra y reabre el panel de capas |
-| Las capas siguen rotas tras aplicar | La ruta asignada no existe o el proveedor no la reconoce | Usar **Vista previa** para verificar la ruta exacta antes de aplicar; comprobar que la carpeta seleccionada es la correcta |
-| Un `.ecw` no se reconecta aunque existe un `.tif` equivalente | La carpeta de destino no coincide con la configurada en pasos 2/3 | Verificar en **Vista previa** que la ruta destino es la correcta; el fallback ECW busca solo en los directorios de destino indicados |
-
----
-
-## Estructura del repositorio
-
-```
-├── plugin_qgis/            # Plugin QGIS (fuente del módulo)
-│   ├── __init__.py
-│   ├── metadata.txt
-│   ├── plugin.py           # Punto de entrada del plugin
-│   ├── repath_core.py      # Lógica pura (sin Qt)
-│   └── repath_dialog.py    # Diálogo Qt (PyQt5)
-├── script_original/        # Script standalone (PySide6)
-│   └── repath.py
-├── .gitignore
-├── LICENSE
-└── README.md
-```
-
-> ⚠️ La carpeta `plugin_qgis/` contiene el código fuente del plugin pero **debe instalarse con el nombre `qgz_repath_tool/`** en QGIS, ya que ese es el nombre del módulo Python declarado en `metadata.txt`. Ver instrucciones de instalación más abajo.
-
-`repath_core.py` no depende de Qt y es compartido conceptualmente por ambos formatos: el script usa sus funciones de clasificación y agrupación; el plugin las usa directamente al importar el módulo.
-
----
-
-## Cambios por versión
-
-### v2.8
-- **Fix lectura de datasources en proyecto no guardado** — `_effective_source()` ahora intenta `layer.publicSource()` antes de recurrir al XML del disco, lo que evita leer datos obsoletos cuando el proyecto tiene cambios sin guardar y la API nativa puede responder.
-- **Fix congelación de GUI con rutas lentas** — `QApplication.processEvents()` en el bucle de `_apply_changes` libera el event loop en cada iteración, evitando que rutas UNC/SMB con timeout largo congelen QGIS.
-- **Fix `refreshAllLayers()` obsoleto** — reemplazado por `QgsMapCanvas.refresh()`, el método correcto en QGIS 3.x. El `try/except AttributeError` era código muerto desde la versión mínima 3.16.
-- **Mejora ToC tras reconexión** — se llama a `layer.triggerRepaint()` después de `setDataSource()` exitoso para que la Tabla de Contenidos actualice inmediatamente el icono de capa rota sin esperar al siguiente repintado global.
-- **VFS cloud completos** — añadidos `/vsis3/`, `/vsigs/`, `/vsiaz/`, `/vsicurl_streaming/`, `/vsioss/`, `/vsiswift/`, `/vsiadls/` a `_SERVICES` para que las capas almacenadas en la nube (AWS S3, Google Cloud Storage, Azure) se ignoren correctamente en el análisis.
-- **Deduplicación de directorios más limpia** — refactorizado el bucle de deduplicación en `find_ecw_substitute` a un dict comprehension que preserva el case real de la ruta mientras compara en minúsculas.
-
-### v2.5
-- **Fallback ECW → raster** — `find_ecw_substitute()` detecta automáticamente archivos `.ecw` sin sustituto directo e intenta reasignarlos al equivalente con extensión raster alternativa (`.tif`, `.tiff`, `.jpg`, `.jpeg`, `.png`, `.img`, `.vrt`, `.sid`, `.adf`) que exista en el directorio de destino. El log identifica estas sustituciones con la etiqueta `✦ ECW→raster` y el resumen final incluye su conteo separado.
-
-### v2.4
-- **Plugin QGIS nuevo** — replica el flujo completo del script como plugin nativo, aplicando cambios en vivo vía `setDataSource()`.
-- **Fix detección QGIS 3.x** — `read_project_datasources()` lee el XML del `.qgz` para recuperar datasources originales cuando `layer.source()` devuelve cadena vacía (comportamiento de QGIS 3.16+ con rutas `localized:` no resueltas).
-- **Fix agrupación unix** — `_group_unix_paths()` reemplaza la agrupación global por agrupación por rama divergente, evitando subcarpetas duplicadas en la salida.
-- **Fix colores multiplataforma** (script) — estilo Fusion + paleta oscura explícita; log reescrito con `insertHtml`.
-
-### v2.3
-- Versión inicial pública del script standalone.
-
----
-
-## Contribuciones
-
-Las contribuciones son bienvenidas. Para reportar un error, incluye en el issue:
-
-- Versión de QGIS y sistema operativo
-- Tipo de rutas afectadas (absolutas Windows, Unix, `localized:`, `.ecw`)
-- Fragmento del log de la herramienta (panel derecho del diálogo)
-
-Para proponer mejoras, abre un Pull Request con descripción del cambio y, si aplica, un proyecto `.qgz` de prueba mínimo sin datos reales.
-
----
+Las versiones 2.x y 3.x usaban un sistema de "anclajes": el plugin intentaba identificar qué carpeta de la ruta vieja era significativa y pedía al usuario su equivalente. Ese enfoque acumuló parches (modo directo, *blocklist* de anclajes genéricos, *cross-resolve*…) sin llegar a ser fiable, porque leía las rutas en la dirección equivocada. La v4.0 es una reescritura completa sobre la observación clave: **las rutas coinciden por el final, así que hay que leerlas de atrás hacia adelante.**
 
 ## Licencia
 
-MIT — consulta el archivo `LICENSE` en la raíz del repositorio.
+GPL-2.0, como requiere el ecosistema de plugins de QGIS.
+
+## Autor
+
+José Carlos Rico — [CITYLAB360, S.C.A.](https://citylab360.es)
+
+¿Bugs o ideas? Abre un [issue](../../issues).
+
